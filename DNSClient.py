@@ -1,76 +1,85 @@
-# -*- coding: utf-8 -*-
-"""
-Created on Fri Mar 13 15:46:49 2026
+import argparse
+import socket
+import struct
 
-@author: medha
-"""
+def dns_query(type, name, server):
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    server_address = (server, 53)  # DNS always runs on port 53
 
-import dns.resolver
+    ID = 0x1234
+    QR = 0; OPCODE = 0; AA = 0; TC = 0; RD = 1
+    RA = 0; Z = 0; RCODE = 0
+    QDCOUNT = 1; ANCOUNT = 0; NSCOUNT = 0; ARCOUNT = 0
 
-# Set the IP address of the local DNS server and a public DNS server
-local_host_ip = "127.0.0.1"
-real_name_server = "8.8.8.8"  # Google's public DNS server
+    # Flags word: each field shifted to its correct bit position
+    # QR=bit15, OPCODE=bits14-11, AA=bit10, TC=bit9, RD=bit8,
+    # RA=bit7, Z=bits6-4, RCODE=bits3-0
+    header = struct.pack('!HHHHHH',
+        ID,
+        QR << 15 | OPCODE << 11 | AA << 10 | TC << 9 | RD << 8 | RA << 7 | Z << 4 | RCODE,
+        QDCOUNT, ANCOUNT, NSCOUNT, ARCOUNT)
 
+    # Encode QNAME: split on '.', prefix each label with its length byte, end with \x00
+    qname_parts = name.split('.')
+    qname_encoded_parts = [struct.pack('B', len(part)) + part.encode('ascii') for part in qname_parts]
+    qname_encoded = b''.join(qname_encoded_parts) + b'\x00'  # null byte terminates the name
 
-# Create a list of domain names to query - use the same list from the DNS Server
-domainList  = ['example.com.','safebank.com.','google.com.','nyu.edu.','legitsite.com.']
+    # QTYPE: A=1 (IPv4), AAAA=28 (IPv6)  — RFC 1035 §3.2.2
+    if type == 'A':
+        qtype = 1
+    elif type == 'AAAA':
+        qtype = 28
 
-# Define a function to query the local DNS server for the IP address of a given domain name
-def query_local_dns_server(domain, question_type):
-    resolver = dns.resolver.Resolver()
-    resolver.nameservers = [local_host_ip]
-    answers = resolver.resolve(domain, question_type)
+    qclass = 1  # IN (Internet) — RFC 1035 §3.2.4
 
-    ip_address = answers[0].to_text()
-    return ip_address   
-    
-# Define a function to query a public DNS server for the IP address of a given domain name
-def query_dns_server(domain, question_type):
-    resolver = dns.resolver.Resolver()
-    resolver.nameservers = [real_name_server]
-    answers = resolver.resolve(domain, question_type)
+    question = qname_encoded + struct.pack('!HH', qtype, qclass)
 
-    ip_address = answers[0].to_text()
-    return ip_address
-    
-# Define a function to compare the results from the local and public DNS servers for each domain name in the list
-def compare_dns_servers(domainList, question_type):
-    for domain_name in domainList:
-        local_ip_address = query_local_dns_server(domain_name, question_type)
-        public_ip_address = query_dns_server(domain_name, question_type)
-        if local_ip_address != public_ip_address:
-            return False
-    return True    
-    
-# Define a function to print the results from querying both the local and public DNS servers for each domain name in the domainList
-def local_external_DNS_output(question_type):    
-    print("Local DNS Server")
-    for domain_name in domainList:
-        ip_address = query_local_dns_server(domain_name, question_type)
-        print(f"The IP address of {domain_name} is {ip_address}")
+    message = header + question  # always send header + question together
+    sock.sendto(message, server_address)
 
-    print("\nPublic DNS Server")
-    for domain_name in domainList:
-        ip_address = query_dns_server(domain_name, question_type)
-        print(f"The IP address of {domain_name} is {ip_address}")
-        
-        
-def exfiltrate_info(domain, question_type):  # testing method for part 2
-    data = query_local_dns_server(domain, question_type)
-    return data 
+    data, _ = sock.recvfrom(4096)
 
-        
-if __name__ == '__main__':
-    
-    # Set the type of DNS query to be performed
-    question_type = 'A'
+    # Response header is fixed 12 bytes (6 × 2-byte fields)
+    response_header = data[:12]
+    ID, FLAGS, QDCOUNT, ANCOUNT, NSCOUNT, ARCOUNT = struct.unpack('!HHHHHH', response_header)
 
-    # Call the function to print the results from querying both DNS servers
-    #local_external_DNS_output(question_type)
-    
-    # Call the function to compare the results from both DNS servers and print the result
-    result = compare_dns_servers(domainList, question_type)
-    result = query_local_dns_server('nyu.edu.', question_type)
-    print(result)
-    
-    #print(exfiltrate_info())
+    # Question section starts right after the 12-byte header
+    response_question = data[12:12+len(question)]
+    assert response_question == question
+
+    # Answer section starts after header + question
+    response_answer = data[12+len(question):]
+    offset = 0
+    for _ in range(ANCOUNT):
+        name_parts = []
+        while True:
+            length = response_answer[offset]
+            offset += 1
+            if length == 0:
+                break
+            elif length & 0xc0 == 0xc0:
+                pointer = struct.unpack('!H', response_answer[offset-1:offset+1])[0] & 0x3fff
+                offset += 1
+                name_parts.append(parse_name(data, pointer))
+                break
+            else:
+                label = response_answer[offset:offset+length].decode('ascii')
+                offset += length
+                name_parts.append(label)
+        name = '.'.join(name_parts)
+
+        # '!HHIH' = 2+2+4+2 = 10 bytes
+        type, cls, ttl, rdlength = struct.unpack('!HHIH', response_answer[offset:offset+10])
+        offset += 10
+
+        rdata = response_answer[offset:offset+rdlength]
+        offset += rdlength
+
+        if type == 1:    # A record
+            ipv4 = socket.inet_ntop(socket.AF_INET, rdata)
+            print(f'{name} has IPv4 address {ipv4}')
+            return ipv4
+        elif type == 28:  # AAAA record
+            ipv6 = socket.inet_ntop(socket.AF_INET6, rdata)
+            print(f'{name} has IPv6 address {ipv6}')
+            return ipv6
